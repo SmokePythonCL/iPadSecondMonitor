@@ -1,0 +1,4 @@
+# Opcional: solo necesario si el compositor no soporta org.freedesktop.portal.RemoteDesktop
+# Copiar a /etc/udev/rules.d/99-ipad-monitor-uinput.rules y ejecutar:
+#   sudo udevadm control --reload-rules && sudo udevadm trigger /dev/uinput
+KERNEL=="uinput", MODE="0660", GROUP="input", TAG+="uaccess"

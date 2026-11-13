@@ -1,0 +1,16 @@
+[Unit]
+Description=iPad Second Monitor Host Daemon (USB + Wi-Fi)
+After=graphical-session.target default.target avahi-daemon.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=@INSTALL_DIR@/linux-server
+ExecStart=/usr/bin/python3 @INSTALL_DIR@/linux-server/host_daemon.py --mode auto
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+PassEnvironment=WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP DBUS_SESSION_BUS_ADDRESS
+
+[Install]
+WantedBy=default.target
