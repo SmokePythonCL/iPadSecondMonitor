@@ -11,15 +11,18 @@ import struct
 import sys
 import threading
 
+from audio_streamer import AudioStreamer
 from config_manager import load_config, set_pin, set_restore_token
 from input_handler import create_input_controller
 from portal_session import PortalManager, PortalStreamInfo
 from protocol import (
     CODEC_AUTO,
     OP_CMD_ACK,
+    OP_CMD_AUDIO,
     OP_CMD_RESET_PORTAL,
     OP_CMD_START,
     OP_CMD_STOP,
+    OP_MT_EVENT,
     OP_TOUCH_EVENT,
     PacketWriter,
     recv_exact,
@@ -39,6 +42,7 @@ class ActiveSession:
         self.is_wifi = is_wifi
         self.portal = PortalManager()
         self.streamer = VideoStreamer()
+        self.audio_streamer = AudioStreamer()
         self.input_ctrl = None
         self.target_width = 1920
         self.target_height = 1440
@@ -70,6 +74,21 @@ class ActiveSession:
                     ev_type, nx, ny, _pressure = struct.unpack(">Bfff", data)
                     if self.input_ctrl is not None:
                         self.input_ctrl.handle_event(ev_type, nx, ny)
+                elif opcode == OP_MT_EVENT:
+                    data = recv_exact(self.sock, 14)
+                    slot, phase, nx, ny, _pressure = struct.unpack(">BBfff", data)
+                    if self.input_ctrl is not None:
+                        self.input_ctrl.handle_multitouch(slot, phase, nx, ny)
+                elif opcode == OP_CMD_AUDIO:
+                    enabled = bool(recv_exact(self.sock, 1)[0])
+                    if enabled:
+                        if self.audio_streamer.start(self.writer):
+                            self.writer.send_status("Audio habilitado: elige 'iPad_Second_Monitor_Audio' en KDE.")
+                        else:
+                            self.writer.send_status("No se pudo crear salida de audio virtual en Linux.")
+                    else:
+                        self.audio_streamer.stop()
+                        self.writer.send_status("Audio hacia el iPad desactivado.")
                 elif opcode == OP_CMD_RESET_PORTAL:
                     set_restore_token(None)
                     self.writer.send_status("Selección de pantalla reiniciada. Pulsa Iniciar para elegir otra.")
@@ -117,7 +136,8 @@ class ActiveSession:
         self.stop_media()
 
     def stop_media(self) -> None:
-        """Stop video capture, virtual input, and KDE portal session."""
+        """Stop video capture, audio capture, virtual input, and KDE portal session."""
+        self.audio_streamer.stop()
         self.streamer.stop()
         if self.input_ctrl is not None:
             self.input_ctrl.close()

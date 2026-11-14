@@ -48,17 +48,21 @@ def _bind_kwin_output_async(device_name: str, output_name: str) -> None:
 
 
 class UinputTouchDevice:
-    """Kernel virtual touch/pointer fallback via /dev/uinput."""
+    """Kernel direct multitouch touchscreen + companion pointer/scroll via /dev/uinput."""
 
     DEVICE_NAME = "iPad Virtual Touchscreen"
-    SCROLL_DEVICE_NAME = "iPad Virtual Scroll"
+    POINTER_DEVICE_NAME = "iPad Virtual Pointer"
+    MAX_SLOTS = 10
 
     UI_SET_EVBIT = 0x40045564
     UI_SET_KEYBIT = 0x40045565
     UI_SET_RELBIT = 0x40045566
     UI_SET_ABSBIT = 0x40045567
+    UI_SET_PROPBIT = 0x4004556E
     UI_DEV_CREATE = 0x5501
     UI_DEV_DESTROY = 0x5502
+
+    INPUT_PROP_DIRECT = 0x01
 
     EV_SYN = 0x00
     EV_KEY = 0x01
@@ -76,35 +80,51 @@ class UinputTouchDevice:
     REL_HWHEEL_HI_RES = 0x0C
     ABS_X = 0x00
     ABS_Y = 0x01
+    ABS_MT_SLOT = 0x2F
+    ABS_MT_POSITION_X = 0x35
+    ABS_MT_POSITION_Y = 0x36
+    ABS_MT_TRACKING_ID = 0x39
 
     def __init__(self, width: int = 1920, height: int = 1080, virtual_output: str | None = None) -> None:
         self.width = max(1, width)
         self.height = max(1, height)
         self.virtual_output = virtual_output
         self.fd: int | None = None
-        self._scroll_fd: int | None = None
+        self._pointer_fd: int | None = None
         self._hires_acc_x = 0.0
         self._hires_acc_y = 0.0
+        self._active_slots: dict[int, int] = {}
+        self._next_tracking_id = 1
         self._open_device()
 
     def _open_device(self) -> None:
         try:
             self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+            fcntl.ioctl(self.fd, self.UI_SET_PROPBIT, self.INPUT_PROP_DIRECT)
             fcntl.ioctl(self.fd, self.UI_SET_EVBIT, self.EV_KEY)
             fcntl.ioctl(self.fd, self.UI_SET_KEYBIT, self.BTN_TOUCH)
-            fcntl.ioctl(self.fd, self.UI_SET_KEYBIT, self.BTN_LEFT)
-            fcntl.ioctl(self.fd, self.UI_SET_KEYBIT, self.BTN_RIGHT)
             fcntl.ioctl(self.fd, self.UI_SET_EVBIT, self.EV_ABS)
-            fcntl.ioctl(self.fd, self.UI_SET_ABSBIT, self.ABS_X)
-            fcntl.ioctl(self.fd, self.UI_SET_ABSBIT, self.ABS_Y)
+            for abs_code in (
+                self.ABS_X,
+                self.ABS_Y,
+                self.ABS_MT_SLOT,
+                self.ABS_MT_POSITION_X,
+                self.ABS_MT_POSITION_Y,
+                self.ABS_MT_TRACKING_ID,
+            ):
+                fcntl.ioctl(self.fd, self.UI_SET_ABSBIT, abs_code)
 
             absmin = [0] * 64
             absmax = [0] * 64
             absmax[self.ABS_X] = self.width
             absmax[self.ABS_Y] = self.height
+            absmax[self.ABS_MT_SLOT] = self.MAX_SLOTS - 1
+            absmax[self.ABS_MT_POSITION_X] = self.width
+            absmax[self.ABS_MT_POSITION_Y] = self.height
+            absmax[self.ABS_MT_TRACKING_ID] = 65535
 
             name = self.DEVICE_NAME.encode("ascii").ljust(80, b"\x00")
-            bus_type, vendor, product, version = 0x03, 0x05AC, 0x0001, 1
+            bus_type, vendor, product, version = 0x03, 0x05AC, 0x0001, 2
             uinput_dev = struct.pack("80sHHHHI", name, bus_type, vendor, product, version, 0)
             uinput_dev += struct.pack("64i", *absmax)
             uinput_dev += struct.pack("64i", *absmin)
@@ -113,7 +133,7 @@ class UinputTouchDevice:
 
             os.write(self.fd, uinput_dev)
             fcntl.ioctl(self.fd, self.UI_DEV_CREATE)
-            print("[Input] ✅ Dispositivo táctil /dev/uinput activo.")
+            print("[Input] ✅ Pantalla táctil multitáctil /dev/uinput activa (INPUT_PROP_DIRECT).")
             if self.virtual_output:
                 _bind_kwin_output_async(self.DEVICE_NAME, self.virtual_output)
         except Exception as exc:
@@ -121,12 +141,16 @@ class UinputTouchDevice:
             self.fd = None
             return
 
-        # Open a companion pure relative mouse for clean 2-finger smooth scrolling
+        # Open a companion pointer device for right-click, 2-finger scroll, and optional trackpad mode
         try:
-            sfd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
-            fcntl.ioctl(sfd, self.UI_SET_EVBIT, self.EV_KEY)
-            fcntl.ioctl(sfd, self.UI_SET_KEYBIT, self.BTN_LEFT)
-            fcntl.ioctl(sfd, self.UI_SET_EVBIT, self.EV_REL)
+            pfd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+            fcntl.ioctl(pfd, self.UI_SET_EVBIT, self.EV_KEY)
+            fcntl.ioctl(pfd, self.UI_SET_KEYBIT, self.BTN_LEFT)
+            fcntl.ioctl(pfd, self.UI_SET_KEYBIT, self.BTN_RIGHT)
+            fcntl.ioctl(pfd, self.UI_SET_EVBIT, self.EV_ABS)
+            fcntl.ioctl(pfd, self.UI_SET_ABSBIT, self.ABS_X)
+            fcntl.ioctl(pfd, self.UI_SET_ABSBIT, self.ABS_Y)
+            fcntl.ioctl(pfd, self.UI_SET_EVBIT, self.EV_REL)
             for code in (
                 self.REL_X,
                 self.REL_Y,
@@ -135,16 +159,26 @@ class UinputTouchDevice:
                 self.REL_WHEEL_HI_RES,
                 self.REL_HWHEEL_HI_RES,
             ):
-                fcntl.ioctl(sfd, self.UI_SET_RELBIT, code)
+                fcntl.ioctl(pfd, self.UI_SET_RELBIT, code)
 
-            s_name = self.SCROLL_DEVICE_NAME.encode("ascii").ljust(80, b"\x00")
-            s_dev = struct.pack("80sHHHHI", s_name, 0x03, 0x05AC, 0x0002, 1, 0)
-            s_dev += struct.pack("64i", *([0] * 64)) * 4
-            os.write(sfd, s_dev)
-            fcntl.ioctl(sfd, self.UI_DEV_CREATE)
-            self._scroll_fd = sfd
+            p_absmin = [0] * 64
+            p_absmax = [0] * 64
+            p_absmax[self.ABS_X] = self.width
+            p_absmax[self.ABS_Y] = self.height
+
+            p_name = self.POINTER_DEVICE_NAME.encode("ascii").ljust(80, b"\x00")
+            p_dev = struct.pack("80sHHHHI", p_name, 0x03, 0x05AC, 0x0002, 2, 0)
+            p_dev += struct.pack("64i", *p_absmax)
+            p_dev += struct.pack("64i", *p_absmin)
+            p_dev += struct.pack("64i", *([0] * 64))
+            p_dev += struct.pack("64i", *([0] * 64))
+            os.write(pfd, p_dev)
+            fcntl.ioctl(pfd, self.UI_DEV_CREATE)
+            self._pointer_fd = pfd
+            if self.virtual_output:
+                _bind_kwin_output_async(self.POINTER_DEVICE_NAME, self.virtual_output)
         except Exception:
-            self._scroll_fd = None
+            self._pointer_fd = None
 
     def _emit_to(self, target_fd: int | None, type_code: int, code: int, value: int) -> None:
         if target_fd is None:
@@ -170,62 +204,109 @@ class UinputTouchDevice:
         return x, y
 
     def _emit_scroll(self, dx: float, dy: float) -> None:
-        if self._scroll_fd is None:
+        if self._pointer_fd is None:
             return
         # StreamSurfaceView sends negative delta*0.15; Linux REL_WHEEL uses positive=up, negative=down
         v_hires = int(round(-dy * 40.0))
         h_hires = int(round(-dx * 40.0))
         if v_hires != 0:
-            self._emit_to(self._scroll_fd, self.EV_REL, self.REL_WHEEL_HI_RES, v_hires)
+            self._emit_to(self._pointer_fd, self.EV_REL, self.REL_WHEEL_HI_RES, v_hires)
             self._hires_acc_y += v_hires
             notches_y = int(self._hires_acc_y / 120.0)
             if notches_y != 0:
-                self._emit_to(self._scroll_fd, self.EV_REL, self.REL_WHEEL, notches_y)
+                self._emit_to(self._pointer_fd, self.EV_REL, self.REL_WHEEL, notches_y)
                 self._hires_acc_y -= notches_y * 120.0
         if h_hires != 0:
-            self._emit_to(self._scroll_fd, self.EV_REL, self.REL_HWHEEL_HI_RES, h_hires)
+            self._emit_to(self._pointer_fd, self.EV_REL, self.REL_HWHEEL_HI_RES, h_hires)
             self._hires_acc_x += h_hires
             notches_x = int(self._hires_acc_x / 120.0)
             if notches_x != 0:
-                self._emit_to(self._scroll_fd, self.EV_REL, self.REL_HWHEEL, notches_x)
+                self._emit_to(self._pointer_fd, self.EV_REL, self.REL_HWHEEL, notches_x)
                 self._hires_acc_x -= notches_x * 120.0
         if v_hires != 0 or h_hires != 0:
-            self._syn(self._scroll_fd)
+            self._syn(self._pointer_fd)
+
+    def handle_multitouch(self, slot: int, phase: int, nx: float, ny: float) -> None:
+        """Emit genuine Linux multitouch ABS_MT_* events on the direct touchscreen."""
+        if self.fd is None:
+            return
+        slot = max(0, min(self.MAX_SLOTS - 1, int(slot)))
+        if phase == TOUCH_DOWN:
+            x, y = self._coords(nx, ny)
+            was_empty = len(self._active_slots) == 0
+            if slot not in self._active_slots:
+                self._next_tracking_id = (self._next_tracking_id % 65534) + 1
+                self._active_slots[slot] = self._next_tracking_id
+            self._emit(self.EV_ABS, self.ABS_MT_SLOT, slot)
+            self._emit(self.EV_ABS, self.ABS_MT_TRACKING_ID, self._active_slots[slot])
+            self._emit(self.EV_ABS, self.ABS_MT_POSITION_X, x)
+            self._emit(self.EV_ABS, self.ABS_MT_POSITION_Y, y)
+            if was_empty:
+                self._emit(self.EV_KEY, self.BTN_TOUCH, 1)
+            if slot == min(self._active_slots):
+                self._emit(self.EV_ABS, self.ABS_X, x)
+                self._emit(self.EV_ABS, self.ABS_Y, y)
+            self._syn()
+        elif phase == TOUCH_MOVE:
+            if slot not in self._active_slots:
+                return
+            x, y = self._coords(nx, ny)
+            self._emit(self.EV_ABS, self.ABS_MT_SLOT, slot)
+            self._emit(self.EV_ABS, self.ABS_MT_POSITION_X, x)
+            self._emit(self.EV_ABS, self.ABS_MT_POSITION_Y, y)
+            if slot == min(self._active_slots):
+                self._emit(self.EV_ABS, self.ABS_X, x)
+                self._emit(self.EV_ABS, self.ABS_Y, y)
+            self._syn()
+        elif phase == TOUCH_UP:
+            if slot not in self._active_slots:
+                return
+            del self._active_slots[slot]
+            self._emit(self.EV_ABS, self.ABS_MT_SLOT, slot)
+            self._emit(self.EV_ABS, self.ABS_MT_TRACKING_ID, -1)
+            if not self._active_slots:
+                self._emit(self.EV_KEY, self.BTN_TOUCH, 0)
+            self._syn()
 
     def handle_event(self, ev_type: int, nx: float, ny: float) -> None:
-        """Process touch, right-click, and smooth scroll events using uinput."""
-        if self.fd is None:
+        """Process pointer/trackpad fallback, right-click, and smooth scroll via companion pointer."""
+        if ev_type == TOUCH_SCROLL:
+            self._emit_scroll(nx, ny)
+            return
+        target = self._pointer_fd
+        if target is None:
             return
         if ev_type == TOUCH_DOWN:
             x, y = self._coords(nx, ny)
-            self._emit(self.EV_ABS, self.ABS_X, x)
-            self._emit(self.EV_ABS, self.ABS_Y, y)
-            self._emit(self.EV_KEY, self.BTN_TOUCH, 1)
-            self._emit(self.EV_KEY, self.BTN_LEFT, 1)
-            self._syn()
+            self._emit_to(target, self.EV_ABS, self.ABS_X, x)
+            self._emit_to(target, self.EV_ABS, self.ABS_Y, y)
+            self._emit_to(target, self.EV_KEY, self.BTN_LEFT, 1)
+            self._syn(target)
         elif ev_type == TOUCH_MOVE:
             x, y = self._coords(nx, ny)
-            self._emit(self.EV_ABS, self.ABS_X, x)
-            self._emit(self.EV_ABS, self.ABS_Y, y)
-            self._syn()
+            self._emit_to(target, self.EV_ABS, self.ABS_X, x)
+            self._emit_to(target, self.EV_ABS, self.ABS_Y, y)
+            self._syn(target)
         elif ev_type == TOUCH_UP:
-            self._emit(self.EV_KEY, self.BTN_TOUCH, 0)
-            self._emit(self.EV_KEY, self.BTN_LEFT, 0)
-            self._syn()
+            self._emit_to(target, self.EV_KEY, self.BTN_LEFT, 0)
+            self._syn(target)
         elif ev_type == TOUCH_RIGHT_CLICK:
+            # Release any active touchscreen slots before issuing contextual right-click
+            for active_slot in list(self._active_slots):
+                self.handle_multitouch(active_slot, TOUCH_UP, nx, ny)
             x, y = self._coords(nx, ny)
-            self._emit(self.EV_ABS, self.ABS_X, x)
-            self._emit(self.EV_ABS, self.ABS_Y, y)
-            self._emit(self.EV_KEY, self.BTN_RIGHT, 1)
-            self._syn()
-            self._emit(self.EV_KEY, self.BTN_RIGHT, 0)
-            self._syn()
-        elif ev_type == TOUCH_SCROLL:
-            self._emit_scroll(nx, ny)
+            self._emit_to(target, self.EV_ABS, self.ABS_X, x)
+            self._emit_to(target, self.EV_ABS, self.ABS_Y, y)
+            self._emit_to(target, self.EV_KEY, self.BTN_RIGHT, 1)
+            self._syn(target)
+            self._emit_to(target, self.EV_KEY, self.BTN_RIGHT, 0)
+            self._syn(target)
 
     def close(self) -> None:
-        """Destroy virtual uinput devices."""
-        for attr in ("fd", "_scroll_fd"):
+        """Release any held touch slots and destroy virtual uinput devices."""
+        for active_slot in list(self._active_slots):
+            self.handle_multitouch(active_slot, TOUCH_UP, 0.0, 0.0)
+        for attr in ("fd", "_pointer_fd"):
             handle = getattr(self, attr)
             if handle is not None:
                 try:
@@ -254,6 +335,11 @@ class PortalRemoteInput:
         x = max(0.0, min(float(self.stream.logical_width), nx * self.stream.logical_width))
         y = max(0.0, min(float(self.stream.logical_height), ny * self.stream.logical_height))
         return x, y
+
+    def handle_multitouch(self, slot: int, phase: int, nx: float, ny: float) -> None:
+        """Fallback multitouch handler for PortalRemoteInput."""
+        if slot == 0:
+            self.handle_event(phase, nx, ny)
 
     def handle_event(self, ev_type: int, nx: float, ny: float) -> None:
         """Forward normalized iPad touch/gesture into the exact virtual monitor stream."""

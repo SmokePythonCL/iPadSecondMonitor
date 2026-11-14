@@ -5,14 +5,19 @@ import AVFoundation
 struct StreamSurfaceView: UIViewRepresentable {
     @ObservedObject var client: MonitorClient
     let fitMode: Bool
+    let touchMode: TouchInteractionMode
     var onToggleMenu: (() -> Void)?
 
     func makeUIView(context: Context) -> StreamDisplayView {
         let view = StreamDisplayView(frame: .zero)
         view.updateFitMode(fitMode)
+        view.updateTouchMode(touchMode)
         view.onToggleMenu = onToggleMenu
         view.onTouch = { [weak client] type, nx, ny, pressure in
             client?.sendTouchEvent(type: type, normX: nx, normY: ny, pressure: pressure)
+        }
+        view.onMultiTouch = { [weak client] slot, phase, nx, ny, pressure in
+            client?.sendMultiTouchEvent(slot: slot, phase: phase, normX: nx, normY: ny, pressure: pressure)
         }
         client.onVideoFrame = { [weak view] payload in
             view?.render(payload: payload)
@@ -22,6 +27,7 @@ struct StreamSurfaceView: UIViewRepresentable {
 
     func updateUIView(_ uiView: StreamDisplayView, context: Context) {
         uiView.updateFitMode(fitMode)
+        uiView.updateTouchMode(touchMode)
         uiView.onToggleMenu = onToggleMenu
         client.onVideoFrame = { [weak uiView] payload in
             uiView?.render(payload: payload)
@@ -38,9 +44,13 @@ final class StreamDisplayView: UIView {
 
     private var currentVideoSize: CGSize = .zero
     private var fitMode: Bool = true
+    private var touchMode: TouchInteractionMode = .directTouch
     private var suppressCurrentTouch = false
+    private var activeSlots: [ObjectIdentifier: UInt8] = [:]
+    private var twoFingerScrollRecognizer: UIPanGestureRecognizer?
 
     var onTouch: ((UInt8, Float, Float, Float) -> Void)?
+    var onMultiTouch: ((UInt8, UInt8, Float, Float, Float) -> Void)?
     var onToggleMenu: (() -> Void)?
 
     override init(frame: CGRect) {
@@ -79,18 +89,12 @@ final class StreamDisplayView: UIView {
     }
 
     private func setupGestures() {
-        // Double tap (1 finger) toggles HUD menu
-        let doubleTap = UITapGestureRecognizer(target: self, action: #selector(handleToggleGesture))
-        doubleTap.numberOfTapsRequired = 2
-        doubleTap.numberOfTouchesRequired = 1
-        doubleTap.cancelsTouchesInView = false
-        addGestureRecognizer(doubleTap)
-
-        // Two-finger single tap also toggles HUD menu
-        let twoFingerTap = UITapGestureRecognizer(target: self, action: #selector(handleToggleGesture))
-        twoFingerTap.numberOfTouchesRequired = 2
-        twoFingerTap.numberOfTapsRequired = 1
-        addGestureRecognizer(twoFingerTap)
+        // Three-finger single tap toggles HUD menu (keeps 1-finger double-tap & 2-finger gestures free for Linux)
+        let threeFingerTap = UITapGestureRecognizer(target: self, action: #selector(handleToggleGesture))
+        threeFingerTap.numberOfTapsRequired = 1
+        threeFingerTap.numberOfTouchesRequired = 3
+        threeFingerTap.cancelsTouchesInView = false
+        addGestureRecognizer(threeFingerTap)
 
         // Long press (0.45s) triggers Linux right-click cleanly with haptic feedback
         let longPress = UILongPressGestureRecognizer(target: self, action: #selector(handleLongPress(_:)))
@@ -98,11 +102,20 @@ final class StreamDisplayView: UIView {
         longPress.allowableMovement = 12.0
         addGestureRecognizer(longPress)
 
-        // Two-finger pan performs smooth scrolling in Linux
+        // Two-finger pan performs smooth scrolling in Trackpad mode only
         let twoFingerScroll = UIPanGestureRecognizer(target: self, action: #selector(handleTwoFingerScroll(_:)))
         twoFingerScroll.minimumNumberOfTouches = 2
         twoFingerScroll.maximumNumberOfTouches = 2
+        twoFingerScroll.isEnabled = (touchMode == .trackpad)
         addGestureRecognizer(twoFingerScroll)
+        twoFingerScrollRecognizer = twoFingerScroll
+    }
+
+    func updateTouchMode(_ mode: TouchInteractionMode) {
+        guard touchMode != mode else { return }
+        releaseAllActiveSlots()
+        touchMode = mode
+        twoFingerScrollRecognizer?.isEnabled = (mode == .trackpad)
     }
 
     func updateFitMode(_ fit: Bool) {
@@ -144,6 +157,7 @@ final class StreamDisplayView: UIView {
 
     @objc private func handleToggleGesture() {
         suppressCurrentTouch = true
+        releaseAllActiveSlots()
         onTouch?(TouchActionType.up, 0, 0, 0)
         onToggleMenu?()
     }
@@ -151,6 +165,7 @@ final class StreamDisplayView: UIView {
     @objc private func handleLongPress(_ recognizer: UILongPressGestureRecognizer) {
         guard recognizer.state == .began else { return }
         suppressCurrentTouch = true
+        releaseAllActiveSlots()
         let loc = recognizer.location(in: self)
         let (nx, ny) = normalizedPoint(for: loc)
         // Release initial touch-down before issuing right click
@@ -177,6 +192,15 @@ final class StreamDisplayView: UIView {
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesBegan(touches, with: event)
+        if touchMode == .directTouch {
+            suppressCurrentTouch = false
+            for touch in touches {
+                if let slot = allocateSlot(for: touch) {
+                    sendMultiTouch(touch, slot: slot, phase: TouchActionType.down)
+                }
+            }
+            return
+        }
         guard touches.count == 1, (event?.allTouches?.count ?? 1) == 1, let touch = touches.first else {
             suppressCurrentTouch = true
             onTouch?(TouchActionType.up, 0, 0, 0)
@@ -188,12 +212,34 @@ final class StreamDisplayView: UIView {
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesMoved(touches, with: event)
-        guard !suppressCurrentTouch, touches.count == 1, let touch = touches.first else { return }
+        guard !suppressCurrentTouch else { return }
+        if touchMode == .directTouch {
+            for touch in touches {
+                let key = ObjectIdentifier(touch)
+                if let slot = activeSlots[key] {
+                    sendMultiTouch(touch, slot: slot, phase: TouchActionType.move)
+                }
+            }
+            return
+        }
+        guard touches.count == 1, let touch = touches.first else { return }
         sendTouch(touch, type: TouchActionType.move)
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesEnded(touches, with: event)
+        if touchMode == .directTouch {
+            for touch in touches {
+                let key = ObjectIdentifier(touch)
+                if let slot = activeSlots.removeValue(forKey: key) {
+                    sendMultiTouch(touch, slot: slot, phase: TouchActionType.up)
+                }
+            }
+            if activeSlots.isEmpty {
+                suppressCurrentTouch = false
+            }
+            return
+        }
         if suppressCurrentTouch {
             suppressCurrentTouch = false
             return
@@ -204,12 +250,53 @@ final class StreamDisplayView: UIView {
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesCancelled(touches, with: event)
+        if touchMode == .directTouch {
+            for touch in touches {
+                let key = ObjectIdentifier(touch)
+                if let slot = activeSlots.removeValue(forKey: key) {
+                    sendMultiTouch(touch, slot: slot, phase: TouchActionType.up)
+                }
+            }
+            if activeSlots.isEmpty {
+                suppressCurrentTouch = false
+            }
+            return
+        }
         if suppressCurrentTouch {
             suppressCurrentTouch = false
             return
         }
         guard let touch = touches.first else { return }
         sendTouch(touch, type: TouchActionType.up)
+    }
+
+    private func allocateSlot(for touch: UITouch) -> UInt8? {
+        let key = ObjectIdentifier(touch)
+        if let existing = activeSlots[key] {
+            return existing
+        }
+        let used = Set(activeSlots.values)
+        for candidate in UInt8(0)..<UInt8(10) {
+            if !used.contains(candidate) {
+                activeSlots[key] = candidate
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    private func releaseAllActiveSlots() {
+        for (_, slot) in activeSlots {
+            onMultiTouch?(slot, TouchActionType.up, 0, 0, 0)
+        }
+        activeSlots.removeAll()
+    }
+
+    private func sendMultiTouch(_ touch: UITouch, slot: UInt8, phase: UInt8) {
+        let loc = touch.location(in: self)
+        let (nx, ny) = normalizedPoint(for: loc)
+        let pressure = Float(touch.maximumPossibleForce > 0 ? touch.force / touch.maximumPossibleForce : 1.0)
+        onMultiTouch?(slot, phase, nx, ny, pressure)
     }
 
     private func sendTouch(_ touch: UITouch, type: UInt8) {

@@ -14,6 +14,7 @@ OP_FRAME_MJPEG = 0x01
 OP_STATUS = 0x02
 OP_FRAME_H264 = 0x04
 OP_AUTH = 0x06
+OP_AUDIO_PCM = 0x07
 
 # Auth statuses
 AUTH_REQUIRED = 0x00
@@ -27,6 +28,8 @@ OP_TOUCH_EVENT = 0x03
 OP_CMD_ACK = 0x05
 OP_AUTH_RESPONSE = 0x06
 OP_CMD_RESET_PORTAL = 0x07
+OP_MT_EVENT = 0x08
+OP_CMD_AUDIO = 0x09
 
 # Touch event types
 TOUCH_DOWN = 0
@@ -121,6 +124,11 @@ class PacketWriter:
         flags = H264_FLAG_KEYFRAME if is_keyframe else 0x00
         header = struct.pack(">BBI", OP_FRAME_H264, flags, len(au_bytes))
         return self._send_bytes(header + au_bytes)
+
+    def send_audio(self, pcm_bytes: bytes) -> bool:
+        """Send raw 48kHz S16LE stereo PCM audio chunk."""
+        header = struct.pack(">BI", OP_AUDIO_PCM, len(pcm_bytes))
+        return self._send_bytes(header + pcm_bytes)
 
     def send_auth_challenge(self, nonce: bytes) -> bool:
         """Request PIN authentication with a 32-byte nonce."""

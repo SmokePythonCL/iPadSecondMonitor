@@ -7,6 +7,7 @@ enum MonitorOpcode {
     static let statusText: UInt8 = 0x02
     static let frameH264: UInt8 = 0x04
     static let authChallengeOrResult: UInt8 = 0x06
+    static let frameAudioPCM: UInt8 = 0x07
 
     // Auth statuses
     static let authRequired: UInt8 = 0x00
@@ -20,6 +21,14 @@ enum MonitorOpcode {
     static let cmdAck: UInt8 = 0x05
     static let authResponse: UInt8 = 0x06
     static let cmdResetPortal: UInt8 = 0x07
+    static let mtEvent: UInt8 = 0x08
+    static let cmdAudio: UInt8 = 0x09
+}
+
+enum TouchInteractionMode: String, CaseIterable, Identifiable {
+    case directTouch = "Táctil"
+    case trackpad = "Puntero"
+    var id: String { rawValue }
 }
 
 enum TouchActionType {

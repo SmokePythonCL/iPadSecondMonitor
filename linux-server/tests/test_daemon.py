@@ -179,5 +179,76 @@ class TestStandbyAndPipeline(unittest.TestCase):
         self.assertEqual(video_pipeline.parse_virtual_output_from_kscreen(sample_plain, 2360, 1640), (None, False))
 
 
+class TestMultitouchAndAudio(unittest.TestCase):
+    def test_audio_packet_framing(self) -> None:
+        a, b = socket.socketpair()
+        try:
+            writer = protocol.PacketWriter(a)
+            self.assertTrue(writer.send_audio(b"\x01\x02\x03\x04"))
+            header = protocol.recv_exact(b, 5)
+            opcode, length = struct.unpack(">BI", header)
+            self.assertEqual(opcode, protocol.OP_AUDIO_PCM)
+            self.assertEqual(length, 4)
+            self.assertEqual(protocol.recv_exact(b, 4), b"\x01\x02\x03\x04")
+            writer.close()
+        finally:
+            a.close()
+            b.close()
+
+    def test_multitouch_slots_without_btn_left(self) -> None:
+        import input_handler
+
+        dev = input_handler.UinputTouchDevice.__new__(input_handler.UinputTouchDevice)
+        dev.width = 2360
+        dev.height = 1640
+        dev.virtual_output = None
+        dev.fd = 99
+        dev._pointer_fd = 100
+        dev._hires_acc_x = 0.0
+        dev._hires_acc_y = 0.0
+        dev._active_slots = {}
+        dev._next_tracking_id = 1
+
+        emitted: list[tuple[int | None, int, int, int]] = []
+        dev._emit_to = lambda fd, t, c, v: emitted.append((fd, t, c, v))  # type: ignore[method-assign]
+
+        # Touch down slot 0 and slot 1
+        dev.handle_multitouch(0, protocol.TOUCH_DOWN, 0.5, 0.5)
+        dev.handle_multitouch(1, protocol.TOUCH_DOWN, 0.25, 0.75)
+        self.assertEqual(set(dev._active_slots.keys()), {0, 1})
+        # Ensure BTN_LEFT (0x110) was never emitted on touchscreen fd=99
+        ts_keys = [(c, v) for (fd, t, c, v) in emitted if fd == 99 and t == dev.EV_KEY]
+        self.assertEqual(ts_keys, [(dev.BTN_TOUCH, 1)])
+
+        # Release slot 0 -> BTN_TOUCH must stay 1 until slot 1 lifts
+        dev.handle_multitouch(0, protocol.TOUCH_UP, 0.5, 0.5)
+        self.assertEqual(set(dev._active_slots.keys()), {1})
+        dev.handle_multitouch(1, protocol.TOUCH_UP, 0.25, 0.75)
+        self.assertEqual(dev._active_slots, {})
+        ts_keys_after = [(c, v) for (fd, t, c, v) in emitted if fd == 99 and t == dev.EV_KEY]
+        self.assertEqual(ts_keys_after, [(dev.BTN_TOUCH, 1), (dev.BTN_TOUCH, 0)])
+
+    def test_audio_streamer_virtual_sink_lifecycle(self) -> None:
+        import audio_streamer
+        from unittest import mock
+
+        calls: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **_kwargs):
+            calls.append(cmd)
+            if "load-module" in cmd:
+                return mock.Mock(returncode=0, stdout="42\n")
+            return mock.Mock(returncode=0, stdout="")
+
+        with mock.patch("audio_streamer.subprocess.run", side_effect=fake_run):
+            mod_id = audio_streamer._load_virtual_sink()
+            self.assertEqual(mod_id, "42")
+            audio_streamer._unload_virtual_sink(mod_id)
+
+        self.assertEqual(calls[0][:3], ["pactl", "load-module", "module-null-sink"])
+        self.assertFalse(any("set-default-sink" in c for c in calls))
+        self.assertEqual(calls[1], ["pactl", "unload-module", "42"])
+
+
 if __name__ == "__main__":
     unittest.main()

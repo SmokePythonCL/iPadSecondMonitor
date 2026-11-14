@@ -30,6 +30,7 @@ private final class NetworkTransportEngine: @unchecked Sendable {
     var onAuthResult: (@Sendable (Bool) -> Void)?
     var onHostsChanged: (@Sendable ([DiscoveredHost]) -> Void)?
     var onFrame: (@Sendable (VideoFramePayload) -> Void)?
+    var onAudioPCM: (@Sendable (Data) -> Void)?
     var onFps: (@Sendable (Double) -> Void)?
 
     func startPassiveServices(usbPort: UInt16) {
@@ -223,6 +224,20 @@ private final class NetworkTransportEngine: @unchecked Sendable {
 
                 trackFrameRate()
                 onFrame?(.h264(auData))
+            } else if opcode == MonitorOpcode.frameAudioPCM {
+                guard rxBuffer.count >= 5 else { break }
+                let length = Int(rxBuffer.readUInt32BE(offset: 1))
+                guard length > 0 && length < 1_000_000 else {
+                    rxBuffer.removeFirst()
+                    continue
+                }
+                let totalNeeded = 5 + length
+                guard rxBuffer.count >= totalNeeded else { break }
+
+                let s = rxBuffer.startIndex
+                let pcmData = Data(rxBuffer[(s + 5)..<(s + totalNeeded)])
+                rxBuffer.removeSubrange(s..<(s + totalNeeded))
+                onAudioPCM?(pcmData)
             } else if opcode == MonitorOpcode.statusText {
                 guard rxBuffer.count >= 3 else { break }
                 let length = Int(rxBuffer.readUInt16BE(offset: 1))
@@ -296,6 +311,15 @@ final class MonitorClient: ObservableObject {
     @Published var savedPin: String {
         didSet { UserDefaults.standard.set(savedPin, forKey: "savedWifiPin") }
     }
+    @Published var isAudioEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(isAudioEnabled, forKey: "audioEnabled")
+            syncAudioStreamingState()
+        }
+    }
+    @Published var touchMode: TouchInteractionMode {
+        didSet { UserDefaults.standard.set(touchMode.rawValue, forKey: "touchMode") }
+    }
 
     @Published var isPinPromptPresented: Bool = false
     @Published var authErrorMessage: String = ""
@@ -303,6 +327,7 @@ final class MonitorClient: ObservableObject {
     var onVideoFrame: ((VideoFramePayload) -> Void)?
 
     private let engine = NetworkTransportEngine()
+    private let audioPlayer = PCMStreamAudioPlayer()
     private var pendingNonce: Data?
     private var triedSavedPinOnCurrentConn = false
 
@@ -312,6 +337,9 @@ final class MonitorClient: ObservableObject {
         let rawCodec = UInt8(UserDefaults.standard.integer(forKey: "codecPreference"))
         self.codecPreference = CodecPreference(rawValue: rawCodec) ?? .autoH264
         self.savedPin = UserDefaults.standard.string(forKey: "savedWifiPin") ?? ""
+        self.isAudioEnabled = UserDefaults.standard.bool(forKey: "audioEnabled")
+        let rawTouch = UserDefaults.standard.string(forKey: "touchMode") ?? TouchInteractionMode.directTouch.rawValue
+        self.touchMode = TouchInteractionMode(rawValue: rawTouch) ?? .directTouch
 
         bindEngineCallbacks()
         engine.startPassiveServices(usbPort: 8888)
@@ -338,6 +366,7 @@ final class MonitorClient: ObservableObject {
                 if transport == .none {
                     self.isHostConnected = false
                     self.isStreaming = false
+                    self.audioPlayer.stop()
                     self.fps = 0.0
                     self.connectedHostName = ""
                     self.isPinPromptPresented = false
@@ -390,11 +419,16 @@ final class MonitorClient: ObservableObject {
             }
         }
 
+        engine.onAudioPCM = { [weak self] pcmData in
+            self?.audioPlayer.enqueuePCM(pcmData)
+        }
+
         engine.onFrame = { [weak self] payload in
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
                 if !self.isStreaming {
                     self.isStreaming = true
+                    self.syncAudioStreamingState()
                 }
                 switch payload {
                 case .h264:
@@ -475,6 +509,7 @@ final class MonitorClient: ObservableObject {
 
     func requestStopScreen() {
         engine.sendRaw(Data([MonitorOpcode.cmdStop]))
+        audioPlayer.stop()
         isStreaming = false
         fps = 0.0
         statusMessage = "Transmisión detenida."
@@ -483,11 +518,25 @@ final class MonitorClient: ObservableObject {
     func requestResetPortal() {
         guard isHostConnected else { return }
         engine.sendRaw(Data([MonitorOpcode.cmdResetPortal]))
+        audioPlayer.stop()
         if isStreaming {
             isStreaming = false
             fps = 0.0
         }
         statusMessage = "Selección olvidada. Pulsa Iniciar para elegir otra pantalla."
+    }
+
+    func syncAudioStreamingState() {
+        guard isHostConnected && isStreaming else {
+            audioPlayer.stop()
+            return
+        }
+        if isAudioEnabled {
+            audioPlayer.start()
+        } else {
+            audioPlayer.stop()
+        }
+        engine.sendRaw(Data([MonitorOpcode.cmdAudio, isAudioEnabled ? 1 : 0]))
     }
 
     func sendTouchEvent(type: UInt8, normX: Float, normY: Float, pressure: Float = 1.0) {
@@ -499,6 +548,23 @@ final class MonitorClient: ObservableObject {
 
         packet.append(MonitorOpcode.touchEvent)
         packet.append(type)
+        withUnsafeBytes(of: &x) { packet.append(contentsOf: $0) }
+        withUnsafeBytes(of: &y) { packet.append(contentsOf: $0) }
+        withUnsafeBytes(of: &p) { packet.append(contentsOf: $0) }
+
+        engine.sendRaw(packet)
+    }
+
+    func sendMultiTouchEvent(slot: UInt8, phase: UInt8, normX: Float, normY: Float, pressure: Float = 1.0) {
+        guard isHostConnected else { return }
+        var packet = Data(capacity: 15)
+        var x = normX.bitPattern.bigEndian
+        var y = normY.bitPattern.bigEndian
+        var p = pressure.bitPattern.bigEndian
+
+        packet.append(MonitorOpcode.mtEvent)
+        packet.append(slot)
+        packet.append(phase)
         withUnsafeBytes(of: &x) { packet.append(contentsOf: $0) }
         withUnsafeBytes(of: &y) { packet.append(contentsOf: $0) }
         withUnsafeBytes(of: &p) { packet.append(contentsOf: $0) }

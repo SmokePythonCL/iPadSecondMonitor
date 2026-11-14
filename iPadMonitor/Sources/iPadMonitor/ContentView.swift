@@ -57,6 +57,7 @@ struct ContentView: View {
             StreamSurfaceView(
                 client: client,
                 fitMode: fitMode,
+                touchMode: client.touchMode,
                 onToggleMenu: {
                     withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
                         isMenuVisible.toggle()
@@ -112,6 +113,40 @@ struct ContentView: View {
                 .foregroundColor(.white)
                 .cornerRadius(10)
             }
+
+            Button(action: {
+                client.isAudioEnabled.toggle()
+            }) {
+                HStack(spacing: 5) {
+                    Image(systemName: client.isAudioEnabled ? "speaker.wave.2.fill" : "speaker.slash.fill")
+                    Text("Audio")
+                        .fontWeight(.medium)
+                }
+                .font(.system(size: 13))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(client.isAudioEnabled ? Color.green.opacity(0.35) : Color.white.opacity(0.15))
+                .foregroundColor(.white)
+                .cornerRadius(10)
+            }
+            .help("Enviar audio de Linux al iPad")
+
+            Button(action: {
+                client.touchMode = (client.touchMode == .directTouch) ? .trackpad : .directTouch
+            }) {
+                HStack(spacing: 5) {
+                    Image(systemName: client.touchMode == .directTouch ? "hand.tap.fill" : "computermouse.fill")
+                    Text(client.touchMode.rawValue)
+                        .fontWeight(.medium)
+                }
+                .font(.system(size: 13))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(Color.white.opacity(0.15))
+                .foregroundColor(.white)
+                .cornerRadius(10)
+            }
+            .help("Alternar entre pantalla táctil directa y modo puntero")
 
             Button(action: {
                 client.requestResetPortal()
@@ -390,10 +425,10 @@ struct ContentView: View {
             Text("Gestos en pantalla Linux:")
                 .font(.caption.bold())
                 .foregroundColor(.gray)
-            HStack(spacing: 16) {
-                Label("Toque = Clic", systemImage: "hand.tap")
+            HStack(spacing: 14) {
+                Label("Táctil / Zoom multitáctil", systemImage: "hand.tap")
                 Label("Mantener = Clic der.", systemImage: "hand.point.up.left.fill")
-                Label("2 dedos = Scroll / Menú", systemImage: "hand.draw")
+                Label("3 dedos = Menú", systemImage: "hand.raised.fingers.spread")
             }
             .font(.caption2)
             .foregroundColor(.white.opacity(0.8))

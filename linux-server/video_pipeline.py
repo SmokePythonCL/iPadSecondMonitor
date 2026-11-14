@@ -99,16 +99,17 @@ def select_encoder_pipeline(gst_mod: Any, codec_pref: int, is_wifi: bool) -> tup
     jpeg_quality = 65 if is_wifi else 78
 
     if codec_pref != CODEC_MJPEG:
+        has_vapostproc = gst_mod.ElementFactory.find("vapostproc") is not None
         for factory_name, fmt, extra in (
             (
                 "vah264lpenc",
                 "NV12",
-                f"vah264lpenc bitrate={bitrate_kbps} key-int-max=60 b-frames=0 target-usage=4",
+                f"vah264lpenc bitrate={bitrate_kbps} key-int-max=60 b-frames=0 target-usage=7",
             ),
             (
                 "vah264enc",
                 "NV12",
-                f"vah264enc bitrate={bitrate_kbps} key-int-max=60 b-frames=0 target-usage=4",
+                f"vah264enc bitrate={bitrate_kbps} key-int-max=60 b-frames=0 target-usage=7",
             ),
             (
                 "x264enc",
@@ -117,8 +118,13 @@ def select_encoder_pipeline(gst_mod: Any, codec_pref: int, is_wifi: bool) -> tup
             ),
         ):
             if gst_mod.ElementFactory.find(factory_name) is not None:
+                if factory_name.startswith("va") and has_vapostproc:
+                    conv = f"vapostproc ! video/x-raw(memory:VAMemory),format={fmt}"
+                else:
+                    conv = f"videoconvert n-threads=4 ! video/x-raw,format={fmt}"
                 chain = (
-                    f"videoconvert ! video/x-raw,format={fmt} ! "
+                    f"queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream ! "
+                    f"{conv} ! "
                     f"{extra} ! "
                     f"h264parse config-interval=-1 ! "
                     f"video/x-h264,profile=main,stream-format=byte-stream,alignment=au"
@@ -127,7 +133,11 @@ def select_encoder_pipeline(gst_mod: Any, codec_pref: int, is_wifi: bool) -> tup
 
     if codec_pref != CODEC_MJPEG:
         print("[Stream] Aviso: ningún encoder H.264 disponible; usando respaldo MJPEG.")
-    return f"videoconvert ! video/x-raw,format=I420 ! jpegenc quality={jpeg_quality} idct-method=ifast", "mjpeg"
+    return (
+        f"queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream ! "
+        f"videoconvert n-threads=4 ! video/x-raw,format=I420 ! jpegenc quality={jpeg_quality} idct-method=ifast",
+        "mjpeg",
+    )
 
 
 def build_pipeline_string(stream: PortalStreamInfo, encoder_chain: str) -> str:
